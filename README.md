@@ -19,7 +19,7 @@ You will need a couple of components:
  * Power cable
  * 5V power adaptor circuit (i.e. something that converts wall socket power to 5V for the Wemos D1)
  * Your local wall mounted power socket (or a cable power socket)
- * An enclosure - a 3d printable model is in [model/](model/) directory (written in openSCAD) - I used universal pcb mounted into the frame, and an a gutted old phone charger for the power supply (so the power supply mount will have to be modified for your situation). Sorry the code is a bit messy.
+ * An enclosure - a 3d printable model is in [model/](model/) directory (written in openSCAD) - I used universal pcb mounted into the frame, and an a gutted old phone charger for the power supply (so the power supply mount will have to be modified for your situation). Lacking any other, I used M3/16 screws everywhere but the display, which uses 4x M3/10 screws (16 were too long). Sorry the code is a bit messy.
 
 ## Wiring
 
