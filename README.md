@@ -1,5 +1,7 @@
 # sous-vide-esp8266
 
+![](photos/built.jpg)
+
 This project implements a simple timer and PID controller for a dumb slow cooker to become both a timer enabled slow cooker and a simple sous-vide cooker.
 
 ## About
@@ -59,3 +61,11 @@ Due to the limited number of pins, A0 is used as a button detection pin.
 
  The input power gets connected to the power adaptor.
  Power adaptor output connects to `5V` and `GND` leads of the Wemos D1.
+
+### Assembly photos
+
+ Here are some assembly photos for easier orientation:
+ 
+ ![](photos/base.jpg)
+ 
+ ![](photos/internals.jpg)
