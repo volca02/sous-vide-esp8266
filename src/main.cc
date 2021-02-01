@@ -18,9 +18,9 @@ using Display = SH1106Spi;
 #define TEMP_SENSOR_PIN D4
 
 #define ROT_KEY_PIN A0
-#define ROT_S1_PIN  D2
-#define ROT_S2_PIN  D0
-#define ROT_STEPS_PER_NOTCH 2
+#define ROT_S1_PIN  D0
+#define ROT_S2_PIN  D2
+#define ROT_STEPS_PER_NOTCH 4
 
 #define RELAY_PIN   D8
 
@@ -51,6 +51,36 @@ Solid state relay:
   D8  -> + port
   GND -> - port
 */
+
+/**
+TEST FIXES/IMPROVEMENTS:
+
+TODO:
+ * Setup phase screen saving (inactive for too long - blank the screen)
+ * Configuration persistence (via IOTWebConf)
+ * Temperature offset option - measure 37C with a medical thermometer, remember the diff
+
+ * Setup mode - hold encoder while powering up to enter setup mode
+   - a menu item to enable wifi hotspot
+   - an option to reset config to defaults
+   - temperature offset setting (so basic we need to have it here directly)
+   - should listen to programming requests
+   - more advanced options done by web page access (IOTWebConf)
+
+ * NTP support, display current time in corner
+ * fahrenheit as a second value when setting temp (no conversion needed when cooking by the book)
+ * MQTT support
+   - report temperature, estimated time(stamp) of end of cooking
+   - set mode, disable cooking remotely, set different temperature, timer
+
+DONE:
+ X SousVide mode does NOT end after timer ends
+ X Re-setting to setup does not put the remaining time back
+ X Moving the remaining time should round it down/up as appropriate to the nearest multiple of the 15min interval
+ X Ready after initial heatup - require one press of the encoder after preheat before activating timer
+   - also after return to setup?
+*/
+
 
 /** This forces ClickEncoder to use A0 as button input
  * (on wemos d1 we don't have a different pin to use!)
@@ -111,7 +141,12 @@ public:
 
     void pause() {
         ran = false;
-        target = elapsed;
+        enabled = false;
+        if (target > elapsed) {
+            target = target - elapsed;
+        } else {
+            target = 0;
+        }
         elapsed = 0;
     }
 
@@ -135,13 +170,15 @@ public:
     }
 
     void move_target(int amount, unsigned long interval = 15 * 60 * 1000) {
+        // the two weird math ops below guarantee us that we will round up to
+        // nearest multiple of interval but move the value at the same time
         if (amount < 0) {
             if (target > interval)
-                target = target - interval;
+                target = interval * ((target - 1) / interval);
             else
                 target = 0;
         } else {
-            target += interval;
+            target = interval * ((target + interval) / interval);
             if (target > MAX_TIMER) target = MAX_TIMER;
         }
     }
@@ -231,8 +268,7 @@ public:
     {
     }
 
-    // TODO: make this configurable?
-    static const constexpr double preheat_threshold = 2.0; // 2.0 Celsius means we're in range
+    static const constexpr double preheat_threshold = 1.0; // +- this means we're in range
 
     void begin() {
         // enable pinout of the relay, and switch heating off as default...
@@ -257,6 +293,7 @@ public:
         } else {
             pid.stop();
             heating_off();
+            started = false;
         }
     }
 
@@ -272,6 +309,9 @@ public:
     bool is_heating() const { return heating; }
     bool is_pid_enabled() const { return pid_mode; }
     double get_target_temp() const { return pid_setpoint; }
+
+    bool is_started() const { return started; }
+    void start() { started = true; }
 
     // **** This section is dedicated to settings ***
     void set_use_pid(bool use_pid) {
@@ -311,6 +351,7 @@ public:
         }
 
         if (!pid_mode) {
+            if (enabled) started = true; // no need to wait here, just override it...
             set_heating(enabled);
             timer.set_enabled(enabled);
             timer.update();
@@ -332,7 +373,7 @@ public:
         // are we preheating or are we set around the target range?
         preheating = !atPoint;
 
-        timer.set_enabled(atPoint);
+        timer.set_enabled(atPoint && started);
         timer.update();
     }
 
@@ -360,6 +401,7 @@ protected:
     bool enabled       = false; // after settings get put in, setting this to true will enable the controller
     bool preheating    = true;  // initial phase after controller gets started
     bool heating       = false; // true if the heater is on
+    bool started       = false; // after initial pre-heat, we wait for user input once
 
     // variables used by autopidrelay
     double pid_input = 0;    // this is set by reading value from the temp_sensor
@@ -423,7 +465,10 @@ public:
     void draw() override;
 
     void enter() override { held = false; };
+
 protected:
+    // pressed button, as last remembered from the draw call
+    ClickEncoder::Button_e last_button = ClickEncoder::Open;
     bool held     = false;
     int counter   = 0;
 };
@@ -603,15 +648,15 @@ protected:
         }
 
         // and also display timer if enabled
-        if (timer.is_enabled()) {
-            unsigned long remaining = timer.get_remaining();
-            unsigned long secs = (remaining % 60000) / 1000;
-            remaining = remaining / 60000; // to minutes
-            snprintf(stmp, 10, "%02ld:%02ld:%02ld", remaining / 60, remaining % 60, secs);
-            disp.drawString(85, 0, stmp);
-        } else {
-            disp.drawString(85, 0, "--:--:--");
-        }
+        unsigned long remaining = timer.get_remaining();
+        unsigned long secs = (remaining % 60000) / 1000;
+        remaining = remaining / 60000; // to minutes
+
+        // a dot means a stopped timer
+        char ts = timer.is_enabled() ? ' ' : '.';
+
+        snprintf(stmp, 10, "%c%02ld:%02ld:%02ld", ts, remaining / 60, remaining % 60, secs);
+        disp.drawString(83, 0, stmp);
     }
 
     UIScreen &get_screen(State st) {
@@ -654,6 +699,10 @@ protected:
 
 /// Screen implementations follow:
 void SetupScreen::draw() {
+    // inactivity counter
+    static int counter = 0;
+    counter++;
+
     auto &disp = ui.get_display();
 
     auto &ctl = ui.get_controller();
@@ -662,6 +711,9 @@ void SetupScreen::draw() {
     // handle input....
     int rot = get_rotation();
     auto b = get_button();
+
+    // any event will reset the inactivity counter
+    if (rot != 0 || b != ClickEncoder::Open) counter = 0;
 
     if (b == ClickEncoder::Released) {
         held = false;
@@ -696,7 +748,7 @@ void SetupScreen::draw() {
         if (selected) {
             // move the value
             if (index == 0) {
-                tmr.move_target(rot);
+                tmr.move_target(rot, held ? 5 * 60 * 1000: 15 * 60 * 1000);
             } else if (index == 1) {
                 ctl.move_target_temp(rot, held ? 0.1 : 1.0);
             }
@@ -704,6 +756,8 @@ void SetupScreen::draw() {
             index = (3 + index + rot) % 3;
         }
     }
+
+    if (counter > 20 * 50) return; // no rendering if inactive for long
 
     // screen rendering itself
 
@@ -740,10 +794,10 @@ void InfoScreen::draw() {
     auto &timer = ui.get_timer();
     auto &ctl = ui.get_controller();
 
-    auto b = get_button();
-    if (b == ClickEncoder::Held) held = true;
-    if (b == ClickEncoder::Released && held) {
-        timer.reset(); // TODO: Use pause, but fix it first (it misbehaves)
+    last_button = get_button();
+    if (last_button == ClickEncoder::Held) held = true;
+    if (last_button == ClickEncoder::Released && held) {
+        timer.pause();
         ctl.disable();
     }
 
@@ -784,7 +838,14 @@ void CookingScreen::draw() {
 
     if (held) disp.fillCircle(5, 15, 3);
 
-    if (ctl.is_pid_enabled()) {
+    if ((!ctl.is_started()) && (last_button == ClickEncoder::Clicked)) {
+        ctl.start();
+    }
+
+    if (!ctl.is_started()) {
+        float ftmp = temp.update(); // current temp
+        snprintf(stmp, 64, "Press to start... %3.1fC", ftmp);
+    } else if (ctl.is_pid_enabled()) {
         float ftmp = temp.update(); // current temp
         unsigned long rem_mins = (remaining + 59999) / 60000; // to minutes, rounded up
         snprintf(stmp, 64, "Cooking... %3.1fC %02ld:%02ld", ftmp, rem_mins / 60, rem_mins % 60);
@@ -810,7 +871,7 @@ void DoneScreen::draw() {
 }
 
 
-AnalogClickEncoder encoder{ROT_S1_PIN, ROT_S2_PIN, ROT_KEY_PIN, ROT_STEPS_PER_NOTCH, false};
+AnalogClickEncoder encoder{ROT_S2_PIN, ROT_S1_PIN, ROT_KEY_PIN, ROT_STEPS_PER_NOTCH, false};
 Display display(OLED_RST_PIN, OLED_DC_PIN, 0 /*cs is unused*/);
 
 TempSensor temp(TEMP_SENSOR_PIN);
