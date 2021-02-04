@@ -10,6 +10,221 @@
 #include <AutoPID.h>
 #include <ClickEncoder.h>
 
+#include <ArduinoOTA.h>
+#include <IotWebConf.h>
+#include <IotWebConfUsing.h>
+#include <PubSubClient.h>
+
+#include <pidautotuner.h>
+
+static int8_t ICACHE_FLASH_ATTR todigit(char ch) {
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+
+    return -1;
+}
+
+static bool validate_dec(const char *buf) {
+    for (;*buf;++buf) {
+        if (todigit(*buf) < 0)
+            return false;
+    }
+    return true;
+}
+
+// ------------ IOT Web Conf Code ------------
+#define NUM_LEN 16 // for the regulator constants
+
+const float pid_loop_interval = 5000; // in ms, loop interval of the pid
+
+bool config_mode = false; // enabled by pressing encoder while starting the device
+
+// this is IOTWebconf side config, with conversion methods to get the values
+class Config {
+public:
+    // PID constants
+    char kp[NUM_LEN] = "0.12";
+    char ki[NUM_LEN] = "0.0003";
+    char kd[NUM_LEN] = "0";
+
+    float get_kp() const { return atof(kp); }
+    float get_ki() const { return atof(ki); }
+    float get_kd() const { return atof(kd); }
+
+    // temperature offset
+    char temp_offset[NUM_LEN] = "0";
+
+    float get_temp_offset() const { return atof(temp_offset); }
+
+    void move_temp_offset(int steps, float step = 0.1) {
+        float cur = get_temp_offset();
+        cur += step * steps;
+        snprintf(temp_offset, NUM_LEN, "%f", cur);
+    }
+
+    // MQTT Server
+    char mqtt_client_id[20];
+    char mqtt_server[41] = "";
+    char mqtt_port[NUM_LEN] = "1883";
+    char mqtt_user[21] = "";
+    char mqtt_pass[21] = "";
+    char mqtt_topic_prefix[41] = "sousvide";
+};
+
+class NetworkHandler {
+public:
+// -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
+    const char *thing_name = "SousVide";
+    const char *wifi_initial_pwd = "password123456"; // password for initial ap
+    const char *config_version = "cv1";
+
+    NetworkHandler(Config &config)
+            : config(config)
+            , dnsServer()
+            , server(80)
+            , iotWebConf(thing_name,
+                         &dnsServer,
+                         &server,
+                         wifi_initial_pwd,
+                         config_version)
+
+            , controller_group("Controller", "")
+            , kp("Kp",
+                 "kp",
+                 config.kp,
+                 NUM_LEN,
+                 nullptr,
+                 "Kp regulator constant",
+                 "step='0.0001'")
+            , ki("Ki",
+                 "ki",
+                 config.ki,
+                 NUM_LEN,
+                 nullptr,
+                 "Ki regulator constant",
+                 "step='0.0001'")
+            , kd("Kd",
+                 "kd",
+                 config.kd,
+                 NUM_LEN,
+                 nullptr,
+                 "Kd regulator constant",
+                 "step='0.0001'")
+            , temp_offset("Temp offset",
+                          "temp_offset",
+                          config.temp_offset,
+                          NUM_LEN,
+                          nullptr,
+                          "Greater val. means the sensor indicates less than real temp.")
+            , mqtt_group("MQTT Connection", "")
+            , mqtt_server("MQTT Server", "mqtt_server", config.mqtt_server, 40)
+            , mqtt_port("MQTT Port",
+                        "mqtt_port",
+                        config.mqtt_port,
+                        NUM_LEN,
+                        nullptr,
+                        "MQTT Server Port")
+            , mqtt_user("MQTT User", "mqtt_user", config.mqtt_user, 20)
+            , mqtt_pass("MQTT Password", "mqtt_pass", config.mqtt_pass, 20)
+            , mqtt_topic(
+                      "MQTT Topic", "mqtt_topic", config.mqtt_topic_prefix, 40)
+    {}
+
+    void setup() {
+        controller_group.addItem(&kp);
+        controller_group.addItem(&ki);
+        controller_group.addItem(&kd);
+        controller_group.addItem(&temp_offset);
+
+        mqtt_group.addItem(&mqtt_server);
+        mqtt_group.addItem(&mqtt_port);
+        mqtt_group.addItem(&mqtt_user);
+        mqtt_group.addItem(&mqtt_pass);
+        mqtt_group.addItem(&mqtt_topic);
+
+        iotWebConf.addParameterGroup(&controller_group);
+        iotWebConf.addParameterGroup(&mqtt_group);
+
+        // TODO: skipAPStartup/forceAPMode
+        iotWebConf.init();
+
+        server.on("/", [&] { handle_root(); });
+        server.on("/config", [&] { iotWebConf.handleConfig(); });
+        server.onNotFound([&] { iotWebConf.handleNotFound(); });
+        iotWebConf.setFormValidator([&] (iotwebconf::WebRequestWrapper*) { return validate_config(); });
+    }
+
+    void handle_root() {
+        // -- Let IotWebConf test and handle captive portal requests.
+        if (iotWebConf.handleCaptivePortal()) {
+            // -- Captive portal request were already served.
+            return;
+        }
+
+        // AP mode config portal
+        auto state = iotWebConf.getState();
+        if (state == IOTWEBCONF_STATE_AP_MODE
+            || state == IOTWEBCONF_STATE_NOT_CONFIGURED)
+        {
+            iotWebConf.handleConfig();
+            return;
+        }
+
+        String s =
+            "<!DOCTYPE html><html lang=\"en\"><head><meta "
+            "name=\"viewport\" content=\"width=device-width, "
+            "initial-scale=1, user-scalable=no\"/>"
+            "<title>SousVide status</title></head><body> PLACEHOLDER!"
+            "<a href='config'>configuration</a>"
+            "</body></html>\n";
+
+        server.send(200, "text/html", s);
+    }
+
+    void update() {
+        iotWebConf.doLoop();
+        server.handleClient();
+    }
+
+    void saveConfig() {
+        iotWebConf.saveConfig();
+    }
+
+protected:
+    bool validate_config() {
+        bool valid = true;
+
+        auto mqtt_p = server.arg(mqtt_port.getId());
+        if (!validate_dec(mqtt_p.c_str())) {
+            mqtt_port.errorMessage = "MQTT Port expects a number!";
+            valid = false;
+        }
+
+        return valid;
+    }
+
+    Config &config;
+    DNSServer dnsServer;
+    WebServer server;
+    IotWebConf iotWebConf;
+
+    // setup params
+    IotWebConfParameterGroup controller_group;
+    IotWebConfNumberParameter kp;
+    IotWebConfNumberParameter ki;
+    IotWebConfNumberParameter kd;
+    IotWebConfNumberParameter temp_offset;
+
+    IotWebConfParameterGroup mqtt_group;
+
+    IotWebConfTextParameter mqtt_server;
+    IotWebConfNumberParameter mqtt_port;
+    IotWebConfTextParameter mqtt_user;
+    IotWebConfTextParameter mqtt_pass;
+    IotWebConfTextParameter mqtt_topic;
+};
+
+// -------------------- HW Config --------------------
 using Display = SH1106Spi;
 
 #define OLED_RST_PIN D3
@@ -29,7 +244,6 @@ const char *version_str = "0.0.1";
 constexpr byte CURSOR_SIZE = 5;
 
 /**
-
 Pinout/connection diagram:
 
 Display (3V3 and GND connected as indicated on display):
@@ -54,11 +268,10 @@ Solid state relay:
 
 /**
 TEST FIXES/IMPROVEMENTS:
-
-TODO:
- * Setup phase screen saving (inactive for too long - blank the screen)
  * Configuration persistence (via IOTWebConf)
  * Temperature offset option - measure 37C with a medical thermometer, remember the diff
+
+TODO:
 
  * Setup mode - hold encoder while powering up to enter setup mode
    - a menu item to enable wifi hotspot
@@ -79,6 +292,7 @@ DONE:
  X Moving the remaining time should round it down/up as appropriate to the nearest multiple of the 15min interval
  X Ready after initial heatup - require one press of the encoder after preheat before activating timer
    - also after return to setup?
+ X Setup phase screen saving (inactive for too long - blank the screen)
 */
 
 
@@ -208,17 +422,19 @@ public:
 
     TempSensor(uint8_t pin) :
         oneWire(pin),
-        dallas(&oneWire)
+        dallas(&oneWire),
+        offset(0)
     {}
 
-    void begin() {
+    void begin(float off) {
+        offset = off;
         dallas.begin();
     }
 
     // update temperature every second
     static const unsigned long UPDATE_INTERVAL = 1000;
 
-    float update() {
+    float get() {
         unsigned long time = millis();
 
         // either time passed or overflowed
@@ -232,13 +448,15 @@ public:
             // TODO: Could record temp history here...
         }
 
-        return temp;
+        // in case someone measured and set this, we add offset here
+        return temp + offset;
     }
 
     unsigned long last_update = 0;
     float temp = 0;
     OneWire oneWire;
     DallasTemperature dallas;
+    float offset;
 };
 
 /*
@@ -257,14 +475,13 @@ public:
 
     Controller(Controller &) = delete;
 
-    Controller(uint8_t pin, TempSensor &temp, Timer &timer)
-            : relay_pin(pin)
+    Controller(Config &conf, uint8_t pin, TempSensor &temp, Timer &timer)
+            : conf(conf)
+            , relay_pin(pin)
             , temp_sensor(temp)
             , timer(timer)
             , pid(&pid_input, &pid_setpoint, &pid_relayState,
-                  // TODO: Tune these constants (for now these are copies of values from:
-                  // https://github.com/r-downing/wifi-sous-vide/
-                  5000, .12, .0003, 0)
+                  pid_loop_interval, conf.get_kp(), conf.get_ki(), conf.get_kd())
     {
     }
 
@@ -277,9 +494,9 @@ public:
 
         // bangbang is used outside of the 4 degress range of the target
         pid.setBangBang(4);
-
-        // 4000 ms for each pid step... slow cooker is slow!
-        pid.setTimeStep(4000);
+        pid.setTimeStep(pid_loop_interval);
+        // we set gains here again because network.setup() read the config for us
+        pid.setGains(conf.get_kp(), conf.get_ki(), conf.get_kd());
     }
 
     // **** this section enables/disables the controller ****
@@ -291,9 +508,12 @@ public:
         if (ena) {
             pid.run();
         } else {
+            // also handle timer
+            timer.pause();
             pid.stop();
             heating_off();
             started = false;
+            preheating = true;
         }
     }
 
@@ -361,7 +581,7 @@ public:
         if (!enabled) return;
 
         // refresh the temperature
-        pid_input = temp_sensor.update();
+        pid_input = temp_sensor.get();
 
         // pid mode follows:
         pid.run();
@@ -371,13 +591,18 @@ public:
         bool atPoint = pid.atSetPoint(preheat_threshold);
 
         // are we preheating or are we set around the target range?
-        preheating = !atPoint;
-
+        // once we get in the temp range, we dont't ever get out
+        // unless we reset the whole process.
+        // This mitigates the issue where we insert the food and
+        // temp drops down, forcing us to wait for preheat again...
+        if (preheating) preheating = !atPoint;
         timer.set_enabled(atPoint && started);
         timer.update();
     }
 
 protected:
+    friend class PIDTuner;
+
     void heating_on() {
         set_heating(true);
     };
@@ -392,6 +617,8 @@ protected:
         heating = ena;
         digitalWrite(relay_pin, ena ? HIGH : LOW);
     }
+
+    Config &conf;
 
     uint8_t relay_pin;
     TempSensor &temp_sensor;
@@ -410,6 +637,211 @@ protected:
 
     AutoPIDRelay pid;
 };
+
+class PIDTuner {
+public:
+    PIDTuner(Config &config, TempSensor &temp, Controller &ctl)
+            : config(config), temp_sensor(temp), ctl(ctl)
+    {
+    }
+
+    bool is_enabled() const { return enabled; }
+
+    float getKp() { return pidtuner.getKp(); }
+    float getKi() { return pidtuner.getKi(); }
+    float getKd() { return pidtuner.getKd(); }
+
+    bool is_finished() {
+        bool finished = pidtuner.isFinished();
+
+        if (enabled && finished) {
+            ctl.heating_off();
+            enabled = false;
+        }
+
+        return finished;
+    }
+
+    void setup() {
+        // only call update if the loop interval reached the pid loop interval
+        pidtuner.setTargetValue(60); // 60 C seems like a good target to tune on
+        pidtuner.setLoopInterval(pid_loop_interval * 1000); // same as AutoPID timestep
+        pidtuner.setOutputRange(0.0f, 1.0f); // same as AutoPIDrelay
+        pidtuner.setZNMode(PIDAutotuner::ZNModeNoOvershoot);
+        pidtuner.setTuningCycles(10);
+    }
+
+    void start() {
+        if (enabled) return;
+
+        enabled = true;
+        pidtuner.startTuningLoop(micros());
+    }
+
+    void stop() {
+        enabled = false;
+    }
+
+    void update() {
+        if (!enabled) return;
+
+        static long prev_ms = 0;
+        auto ms = micros();
+
+        // only handle updates every loop time, the same as AutoPID does
+        if ((ms - prev_ms) > (pid_loop_interval * 1000)) {
+            prev_ms = ms;
+
+            if (pidtuner.isFinished()) {
+                ctl.heating_off();
+                return;
+            }
+
+            control_value = pidtuner.tune(temp_sensor.get(), ms);
+        }
+
+        // handle the heating element
+        handle_heater();
+    }
+
+protected:
+    void handle_heater() {
+        // just a precaution
+        if (!enabled) {
+            ctl.heating_off();
+            return;
+        }
+
+        // this has to align with how the RelayAutoPID works!
+        auto pulseWidth = pid_loop_interval;
+        while ((millis() - last_pulse_time) > pulseWidth) last_pulse_time += pid_loop_interval;
+        bool should_heat = (millis() - last_pulse_time) < (control_value * pid_loop_interval);
+        ctl.set_heating(should_heat);
+    }
+
+    bool enabled = false;
+    Config &config;
+    TempSensor &temp_sensor;
+    PIDAutotuner pidtuner;
+    Controller &ctl;
+    double control_value = 0;
+    unsigned long last_pulse_time = 0;
+};
+
+/// Handles status update messages to mqtt, and listens to mqtt commands back
+class MQTTHandler {
+public:
+    MQTTHandler(Config &conf, Controller &ctl)
+            : conf(conf), enabled(false), wifiClient(), client(wifiClient), ctl(ctl)
+    {
+        set_temp_topic[0] = 0;
+        set_status_topic[0] = 0;
+    }
+
+    bool is_enabled() const { return enabled; }
+
+    void setup() {
+        // TODO: Publish device capabilities for homeassistant
+        enabled = strlen(conf.mqtt_server) > 0;
+
+        if (enabled) {
+            int port = atoi(conf.mqtt_port);
+            client.setServer(conf.mqtt_server, port);
+            client.setCallback([&](char *topic, byte *payload, unsigned int length){ callback(topic, payload, length); });
+            snprintf(set_temp_topic, 128, "%s/temp/set", conf.mqtt_topic_prefix);
+            snprintf(set_status_topic, 128, "%s/status/set", conf.mqtt_topic_prefix);
+        }
+    }
+
+    void loop() { client.loop(); }
+
+    void update(float temp, const char *status) {
+        if (!enabled) return;
+
+        if (!client.connected()) connect();
+
+        if (client.connected()) {
+            Serial.println("MQTT Publish");
+            // report back
+            char topic[128];
+            snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
+            client.publish(topic, String(temp).c_str());
+            snprintf(topic, 128, "%s/status", conf.mqtt_topic_prefix);
+            client.publish(topic, status);
+        }
+    }
+
+private:
+    enum Status {
+        STAT_UNKNOWN = 0,
+        STAT_STOP,
+        STAT_START
+    };
+
+    void callback(char* topic, byte* payload, unsigned int length) {
+        if (strcmp(topic, set_temp_topic) == 0) {
+            float temp = atof((char*)payload);
+            ctl.set_target_temp(temp);
+        } else if (strcmp(topic, set_status_topic) == 0) {
+            Status s = str_to_status((char *)payload, length);
+            switch (s) {
+            case STAT_STOP: ctl.disable(); break;
+            case STAT_START: ctl.set_enabled(true); break;
+            default: ;// ---- ignore
+            }
+        }
+    }
+
+
+    Status str_to_status(const char *payload, unsigned length) {
+        if (length == 0) return STAT_UNKNOWN;
+
+        if (payload[0] == 's') {
+            if (strncmp(payload, "start", 5) == 0) return STAT_START;
+            if (strncmp(payload, "stop", 4) == 0) return STAT_STOP;
+        }
+
+        return STAT_UNKNOWN;
+    }
+
+    void connect() {
+        if (!client.connected()) {
+            static unsigned long last_conn = 0;
+            auto now = millis();
+            // once every 5s is more than enough
+            if ((now - last_conn) <  5000) return;
+            last_conn = now;
+
+            Serial.println("MQTT Conn");
+            String clientId = "SousVide-";
+            clientId += String(random(0xffff), HEX);
+
+            bool conn = false;
+            if (strlen(conf.mqtt_user) > 0) {
+                conn = client.connect(clientId.c_str(), conf.mqtt_user, conf.mqtt_pass);
+            } else {
+                conn = client.connect(clientId.c_str());
+            }
+
+            if (conn) {
+                Serial.println("MQTT Conn OK");
+                client.subscribe(set_temp_topic);
+                client.subscribe(set_status_topic);
+            } else {
+                Serial.println("MQTT Conn failed");
+            }
+        }
+    }
+
+    Config &conf;
+    bool enabled;
+    WiFiClient wifiClient;
+    PubSubClient client;
+    Controller &ctl;
+    char set_temp_topic[128]; // built in setup to avouid doing this repetedly
+    char set_status_topic[128]; // built in setup to avouid doing this repetedly
+};
+
 
 class UI;
 
@@ -445,12 +877,25 @@ private:
     ClickEncoder::Button button; // clear this after using to ClickEncoder::Open!
 };
 
+class ConfigScreen : public UIScreen {
+public:
+    ConfigScreen(UI &ui) : UIScreen(ui) {}
+
+    void draw() override;
+    void enter() override { index = 0; selected = false; held = false; }
+
+protected:
+    bool selected = false; // true if item is selected
+    bool held     = false;
+    int index     = 0;
+};
+
 class SetupScreen : public UIScreen {
 public:
     SetupScreen(UI &ui) : UIScreen(ui) {}
     void draw() override;
 
-    void enter() override { index = 0; selected = false; }
+    void enter() override { index = 0; selected = false; held = false; }
 
 protected:
     bool selected = false; // true if item is selected
@@ -471,6 +916,12 @@ protected:
     ClickEncoder::Button_e last_button = ClickEncoder::Open;
     bool held     = false;
     int counter   = 0;
+};
+
+class AutotuneScreen : public InfoScreen {
+public:
+    AutotuneScreen(UI &ui) : InfoScreen(ui) {}
+    void draw() override;
 };
 
 class PreheatScreen : public InfoScreen {
@@ -495,19 +946,27 @@ class UI {
 public:
     UI(UI &) = delete;
 
-    UI(Display &display,
+    UI(Config &conf,
+       Display &display,
        ClickEncoder &encoder,
        Controller &controller,
+       PIDTuner &pidtuner,
        TempSensor &temp_sensor,
-       Timer &timer)
-            : ctl(controller)
+       Timer &timer,
+       NetworkHandler &network)
+            : conf(conf)
+            , ctl(controller)
+            , pidtuner(pidtuner)
             , temp(temp_sensor)
             , timer(timer)
+            , network(network)
             , disp(display)
             , encoder(encoder)
             , width(display.getWidth())
             , height(display.getHeight())
             , state(ST_SETUP)
+            , screen_config(*this)
+            , screen_autotune(*this)
             , screen_setup(*this)
             , screen_preheat(*this)
             , screen_cooking(*this)
@@ -532,6 +991,10 @@ public:
         disp.setFont(ArialMT_Plain_10);
         disp.drawString(10, 40, version_str);
 
+        if (config_mode) {
+            disp.drawString(70, 40, "CONFIG");
+        }
+
         disp.display();
 
         delay(500);
@@ -551,15 +1014,28 @@ public:
     }
 
     enum State {
-        ST_SETUP = 1,
+        ST_CONFIG = 0,
+        ST_AUTOTUNE,
+        ST_SETUP,
         ST_PREHEAT,
         ST_COOKING,
         ST_DONE
     };
 
     void update() {
-        // will handle timer and temp_sensor update for us...
-        ctl.update();
+        if (pidtuner.is_enabled()) {
+            pidtuner.update();
+
+            // this will handle disabling the autotuner as well...
+            if (pidtuner.is_finished()) {
+                snprintf(conf.kp, NUM_LEN, "%f", pidtuner.getKp());
+                snprintf(conf.ki, NUM_LEN, "%f", pidtuner.getKi());
+                snprintf(conf.kd, NUM_LEN, "%f", pidtuner.getKd());
+            }
+        } else {
+            // will handle timer and temp_sensor update for us...
+            ctl.update();
+        }
 
         // analyze the controller state and change ui accordingly
         State new_state = infer_state();
@@ -570,13 +1046,7 @@ public:
             state = new_state;
         }
 
-        // handle encoder input...
         uint32_t ms = micros();
-
-        if (ms - lastService > 1000) {
-            lastService = ms;
-            encoder.service();
-        }
 
         auto &scr = get_screen(state);
 
@@ -584,8 +1054,6 @@ public:
         int revs = encoder.getValue(); // relative steps that happened this update
 
         ClickEncoder::Button b = encoder.getButton();
-
-//        bool changed = false;
 
         if (revs != 0) { scr.on_rotate(revs); input = true; }
         if (b    != ClickEncoder::Open) { scr.on_button(b); input = true; }
@@ -606,11 +1074,23 @@ public:
         }
     }
 
+    Config     &get_config()     { return conf; }
     Display    &get_display()    { return disp; }
 
     Controller &get_controller() { return ctl; }
+    PIDTuner   &get_pidtuner() { return pidtuner; }
     TempSensor &get_tempsensor() { return temp; }
     Timer      &get_timer()      { return timer; }
+    NetworkHandler &get_network()    { return network; }
+
+    State infer_state() {
+        if (pidtuner.is_enabled()) return ST_AUTOTUNE;
+        if (config_mode) return ST_CONFIG;
+        if (timer.done()) return ST_DONE;
+        if (!ctl.is_enabled()) return ST_SETUP;
+        if (ctl.is_preheating()) return ST_PREHEAT;
+        return ST_COOKING;
+    }
 
 protected:
     void draw_status_bar() {
@@ -637,7 +1117,7 @@ protected:
         // since the controls are lagging when temp measurement is done,
         // do this only if we don't need controls
         if (ctl.is_pid_enabled() && ctl.is_enabled()) {
-            float ftmp = temp.update();
+            float ftmp = temp.get();
             snprintf(stmp, 10, "%3.1f C", ftmp);
             disp.drawString(10, 0, stmp);
             ftmp = ctl.get_target_temp();
@@ -661,6 +1141,8 @@ protected:
 
     UIScreen &get_screen(State st) {
         switch (state) {
+        case ST_CONFIG:  return screen_config;
+        case ST_AUTOTUNE: return screen_autotune;
         case ST_SETUP:   return screen_setup;
         case ST_PREHEAT: return screen_preheat;
         case ST_COOKING: return screen_cooking;
@@ -669,16 +1151,13 @@ protected:
         }
     }
 
-    State infer_state() {
-        if (timer.done()) return ST_DONE;
-        if (!ctl.is_enabled()) return ST_SETUP;
-        if (ctl.is_preheating()) return ST_PREHEAT;
-        return ST_COOKING;
-    }
+    Config &conf;
 
     Controller &ctl;
+    PIDTuner   &pidtuner;
     TempSensor &temp;
     Timer &timer;
+    NetworkHandler &network;
 
     Display &disp;
     ClickEncoder &encoder;
@@ -691,6 +1170,8 @@ protected:
     bool input = false; // set to true if input happened
 
     // all the screens
+    ConfigScreen screen_config;
+    AutotuneScreen screen_autotune;
     SetupScreen screen_setup;
     PreheatScreen screen_preheat;
     CookingScreen screen_cooking;
@@ -698,6 +1179,91 @@ protected:
 };
 
 /// Screen implementations follow:
+void ConfigScreen::draw() {
+    // inactivity counter
+    static int counter = 0;
+    counter++;
+
+    auto &disp = ui.get_display();
+
+    auto &conf = ui.get_config();
+    auto &pidtuner = ui.get_pidtuner();
+    auto &network = ui.get_network();
+
+    // handle input....
+    int rot = get_rotation();
+    auto b = get_button();
+
+    // any event will reset the inactivity counter
+    if (rot != 0 || b != ClickEncoder::Open) counter = 0;
+
+    bool released = false;
+    if (b == ClickEncoder::Released) { released = true; }
+
+    if (b == ClickEncoder::Clicked) {
+        held = false;
+        selected = !selected;
+    } else if (b == ClickEncoder::Held) {
+        if (!held) {
+            held = true;
+        }
+    }
+
+    // no select for first item...
+    if (selected && index == 0) selected = false;
+
+    if (released && held && index == 0) {
+        pidtuner.start();
+    }
+
+    if (rot != 0) {
+        if (selected) {
+            // move the value
+            if (index == 1) {
+                conf.move_temp_offset(rot, held ? 0.1 : 1.0);
+            }
+        } else {
+            // change selected item
+            index = (3 + index + rot) % 3;
+        }
+    }
+
+    // selected the cook option?
+    if (selected && index == 2) {
+        // save the new config, and reboot
+        network.saveConfig();
+        ESP.restart();
+    }
+
+    // reset held flag if button was released
+    if (released) held = false;
+
+    if (counter > 20 * 50) return; // no rendering if inactive for long
+
+    // screen rendering itself
+    const int voff = 50; // offseting of the values...
+
+    disp.drawString(10, 15, "PID autotune");
+    disp.drawString(10, 30, "T Delta");
+    disp.drawString(10, 45, "[Save & reboot]");
+
+    char st[32];
+
+    disp.drawLine(voff + 40, 15, voff + 40, 56);
+
+    snprintf(st, 16, "P%s", conf.kp);
+    disp.drawString(voff + 43, 15, st);
+    snprintf(st, 16, "I%s", conf.ki);
+    disp.drawString(voff + 43, 30, st);
+    snprintf(st, 16, "D%s", conf.kd);
+    disp.drawString(voff + 43, 45, st);
+
+    snprintf(st, 16, "%3.1f C", conf.get_temp_offset()); // may be slow due to number conversion...
+    disp.drawString(voff + 10, 30, st);
+
+    draw_cursor_horizonal(disp, 3 + (selected ? voff : 0), 4 + 15 * (index + 1), held);
+}
+
 void SetupScreen::draw() {
     // inactivity counter
     static int counter = 0;
@@ -765,7 +1331,7 @@ void SetupScreen::draw() {
     // in 15 minute increments...
     disp.drawString(10, 15, "Timer");
     disp.drawString(10, 30, "Temp");
-    disp.drawString(10, 45, "Cook");
+    disp.drawString(10, 45, "[Cook]");
 
     int minutes = tmr.get_target() / 60000;
 
@@ -791,19 +1357,36 @@ void SetupScreen::draw() {
 
 void InfoScreen::draw() {
     auto &disp = ui.get_display();
-    auto &timer = ui.get_timer();
     auto &ctl = ui.get_controller();
+    auto &pidtuner = ui.get_pidtuner();
 
     last_button = get_button();
     if (last_button == ClickEncoder::Held) held = true;
     if (last_button == ClickEncoder::Released && held) {
-        timer.pause();
         ctl.disable();
+        pidtuner.stop();
     }
 
     if (held) disp.fillCircle(5, 16, 3);
 
     counter++;
+}
+
+void AutotuneScreen::draw() {
+    InfoScreen::draw();
+
+    auto &disp = ui.get_display();
+    auto &temp = ui.get_tempsensor();
+
+    char stmp[32];
+
+    float ftmp = temp.get();
+
+    // TODO: Hack the autotune library to give us i loop index so we can monitor progress
+    snprintf(stmp, 32, "Autotune... %3.1f C", ftmp);
+
+    // could also print current kp, ki and kd
+    disp.drawString(10, 15 + (10 * ((counter / 60) % 4)), stmp);
 }
 
 void PreheatScreen::draw() {
@@ -815,7 +1398,7 @@ void PreheatScreen::draw() {
 
     char stmp[32];
 
-    float ftmp = temp.update();
+    float ftmp = temp.get();
     float ftgt = ctl.get_target_temp();
 
     snprintf(stmp, 32, "Preheat %3.1f > %3.1f C", ftmp, ftgt);
@@ -843,10 +1426,10 @@ void CookingScreen::draw() {
     }
 
     if (!ctl.is_started()) {
-        float ftmp = temp.update(); // current temp
+        float ftmp = temp.get(); // current temp
         snprintf(stmp, 64, "Press to start... %3.1fC", ftmp);
     } else if (ctl.is_pid_enabled()) {
-        float ftmp = temp.update(); // current temp
+        float ftmp = temp.get(); // current temp
         unsigned long rem_mins = (remaining + 59999) / 60000; // to minutes, rounded up
         snprintf(stmp, 64, "Cooking... %3.1fC %02ld:%02ld", ftmp, rem_mins / 60, rem_mins % 60);
     } else {
@@ -862,7 +1445,6 @@ void DoneScreen::draw() {
     InfoScreen::draw();
 
     auto &disp = ui.get_display();
-    auto &timer = ui.get_timer();
 
     if (held)
         disp.drawString(10, 15 + (10 * ((counter / 60) % 4)), "Done...");
@@ -874,16 +1456,20 @@ void DoneScreen::draw() {
 AnalogClickEncoder encoder{ROT_S2_PIN, ROT_S1_PIN, ROT_KEY_PIN, ROT_STEPS_PER_NOTCH, false};
 Display display(OLED_RST_PIN, OLED_DC_PIN, 0 /*cs is unused*/);
 
+Config conf;
+NetworkHandler network(conf); // loads the config for us
 TempSensor temp(TEMP_SENSOR_PIN);
 Timer timer;
-Controller controller(RELAY_PIN, temp, timer);
-UI ui(display, encoder, controller, temp, timer);
+Controller controller(conf, RELAY_PIN, temp, timer);
+PIDTuner pidtuner(conf, temp, controller);
+UI ui(conf, display, encoder, controller, pidtuner, temp, timer, network);
+MQTTHandler mqtt(conf, controller);
 
 void check_temp_sensor()
 {
     float t = DEVICE_DISCONNECTED_C;
     do {
-        t = temp.update();
+        t = temp.get();
 
         if (t == DEVICE_DISCONNECTED_C) {
             ui.error_screen("Temp. sensor!");
@@ -895,15 +1481,34 @@ void check_temp_sensor()
 
 void setup()
 {
+    Serial.begin(38400);
+
+    // is setup mode requested? Holding down the encoder on start will cause that
+    config_mode = analogRead(ROT_KEY_PIN) < 128; // hardcoded, should do
+
+    // we enable programming over WiFi in setup mode
+    if (config_mode) ArduinoOTA.begin();
+
+    // encoder button is digital, we do this by hand instead
+    network.setup();
+
     encoder.setButtonHeldEnabled(true);
     encoder.setDoubleClickEnabled(false);
     // for esp8266, since pin no. zero is valid
     encoder.setButtonOnPinZeroEnabled(true);
     encoder.setHoldTime(500);
 
-    temp.begin();
+    temp.begin(conf.get_temp_offset());
     controller.begin();
     ui.begin();
+
+    mqtt.setup();
+
+    if (mqtt.is_enabled()) {
+        Serial.println("MQTT is enabled");
+    } else {
+        Serial.println("MQTT is disabled");
+    }
 
     // check for temp sensor
     check_temp_sensor();
@@ -911,5 +1516,43 @@ void setup()
 
 void loop()
 {
+    if (config_mode) ArduinoOTA.handle();
+    network.update();
+
+    // handle encoder input...
+    static uint32_t last_service = 0;
+    uint32_t ms = micros();
+
+    // every millisecond we handle the encoder
+    if (ms - last_service > 1000) {
+        last_service = ms;
+        encoder.service();
+    }
+
     ui.update();
+
+    mqtt.loop();
+
+    // every ~minute we report to mqtt handler
+    // - so in case MQTT is enabled, we get updates there and control commands back
+    static unsigned long last_mqtt = 0;
+
+    // every half minute is enough?
+    if (ms - last_mqtt > 30000000) {
+        last_mqtt = ms;
+
+        Serial.println("MQTT update");
+        const char *status = "unknown";
+
+        switch (ui.infer_state()) {
+        case UI::ST_AUTOTUNE: status = "autotune"; break;
+        case UI::ST_CONFIG:   status = "config";   break;
+        case UI::ST_DONE:     status = "done";     break;
+        case UI::ST_SETUP:    status = "setup";    break;
+        case UI::ST_PREHEAT:  status = "preheat";  break;
+        case UI::ST_COOKING:  status = "cooking";  break;
+        }
+
+        mqtt.update(temp.get(), status);
+    }
 }

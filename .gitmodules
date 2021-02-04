@@ -1,0 +1,6 @@
+[submodule "lib/encoder"]
+	path = lib/encoder
+	url = https://github.com/soligen2010/encoder.git
+[submodule "lib/arduino-pid-autotuner"]
+	path = lib/arduino-pid-autotuner
+	url = https://github.com/BerranRemzi/arduino-pid-autotuner.git
