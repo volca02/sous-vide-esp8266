@@ -267,24 +267,10 @@ Solid state relay:
 */
 
 /**
-TEST FIXES/IMPROVEMENTS:
- * Configuration persistence (via IOTWebConf)
- * Temperature offset option - measure 37C with a medical thermometer, remember the diff
-
 TODO:
-
- * Setup mode - hold encoder while powering up to enter setup mode
-   - a menu item to enable wifi hotspot
-   - an option to reset config to defaults
-   - temperature offset setting (so basic we need to have it here directly)
-   - should listen to programming requests
-   - more advanced options done by web page access (IOTWebConf)
-
  * NTP support, display current time in corner
  * fahrenheit as a second value when setting temp (no conversion needed when cooking by the book)
- * MQTT support
-   - report temperature, estimated time(stamp) of end of cooking
-   - set mode, disable cooking remotely, set different temperature, timer
+ * FIX PID autotune. Currently does not work
 
 DONE:
  X SousVide mode does NOT end after timer ends
@@ -293,6 +279,12 @@ DONE:
  X Ready after initial heatup - require one press of the encoder after preheat before activating timer
    - also after return to setup?
  X Setup phase screen saving (inactive for too long - blank the screen)
+ X Config mode
+ X MQTT support
+   - report temperature, estimated time(stamp) of end of cooking
+   - set mode, disable cooking remotely, set different temperature, timer
+ X Configuration persistence (via IOTWebConf)
+ X Temperature offset option - measure 37C with a medical thermometer, remember the diff
 */
 
 
