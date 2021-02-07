@@ -152,6 +152,8 @@ public:
         server.on("/config", [&] { iotWebConf.handleConfig(); });
         server.onNotFound([&] { iotWebConf.handleNotFound(); });
         iotWebConf.setFormValidator([&] (iotwebconf::WebRequestWrapper*) { return validate_config(); });
+
+        server.begin();
     }
 
     void handle_root() {
@@ -270,7 +272,6 @@ Solid state relay:
 TODO:
  * NTP support, display current time in corner
  * fahrenheit as a second value when setting temp (no conversion needed when cooking by the book)
- * FIX PID autotune. Currently does not work
 
 DONE:
  X SousVide mode does NOT end after timer ends
@@ -285,6 +286,7 @@ DONE:
    - set mode, disable cooking remotely, set different temperature, timer
  X Configuration persistence (via IOTWebConf)
  X Temperature offset option - measure 37C with a medical thermometer, remember the diff
+ X FIX PID autotune. Currently does not work
 */
 
 
@@ -421,22 +423,26 @@ public:
     void begin(float off) {
         offset = off;
         dallas.begin();
-    }
 
-    // update temperature every second
-    static const unsigned long UPDATE_INTERVAL = 1000;
+        //
+        dallas.getAddress(tempDeviceAddress, 0);
+        dallas.setResolution(tempDeviceAddress, resolution);
+        dallas.setWaitForConversion(false);
+        dallas.requestTemperatures();
+        // calculate the delay needed to read the temp
+        delayInMillis = 750 / (1 << (12 - resolution));
+        last_update = millis();
+    }
 
     float get() {
         unsigned long time = millis();
 
         // either time passed or overflowed
-        if (time - last_update > UPDATE_INTERVAL) {
+        if (time - last_update > delayInMillis) {
             dallas.requestTemperatures();
             temp = dallas.getTempCByIndex(0);
-
-            // only update the interval if succesful
-            if (temp != DEVICE_DISCONNECTED_C) last_update = time;
-
+            last_update = time;
+            dallas.requestTemperatures();
             // TODO: Could record temp history here...
         }
 
@@ -449,6 +455,10 @@ public:
     OneWire oneWire;
     DallasTemperature dallas;
     float offset;
+
+    int resolution = 10;
+    DeviceAddress tempDeviceAddress;
+    int  delayInMillis = 0; //
 };
 
 /*
@@ -487,6 +497,10 @@ public:
         // bangbang is used outside of the 4 degress range of the target
         pid.setBangBang(4);
         pid.setTimeStep(pid_loop_interval);
+        set_gains();
+    }
+
+    void set_gains() {
         // we set gains here again because network.setup() read the config for us
         pid.setGains(conf.get_kp(), conf.get_ki(), conf.get_kd());
     }
@@ -562,15 +576,19 @@ public:
             return;
         }
 
+        // early exit if disabled. This means PIDTuner can override and use
+        // set_heater without us immediately switching it off due to disabled
+        // controller
+        if (!enabled) return;
+
+        // below, all code is with enabled on...
         if (!pid_mode) {
-            if (enabled) started = true; // no need to wait here, just override it...
-            set_heating(enabled);
-            timer.set_enabled(enabled);
+            started = true; // no need to wait here, just override it...
+            set_heating(true);
+            timer.set_enabled(true);
             timer.update();
             return;
         }
-
-        if (!enabled) return;
 
         // refresh the temperature
         pid_input = temp_sensor.get();
@@ -639,9 +657,9 @@ public:
 
     bool is_enabled() const { return enabled; }
 
-    float getKp() { return pidtuner.getKp(); }
-    float getKi() { return pidtuner.getKi(); }
-    float getKd() { return pidtuner.getKd(); }
+    float get_kp() { return pidtuner.getKp(); }
+    float get_ki() { return pidtuner.getKi(); }
+    float get_kd() { return pidtuner.getKd(); }
 
     bool is_finished() {
         bool finished = pidtuner.isFinished();
@@ -656,16 +674,15 @@ public:
 
     void setup() {
         // only call update if the loop interval reached the pid loop interval
-        pidtuner.setTargetValue(60); // 60 C seems like a good target to tune on
+        pidtuner.setTargetValue(60.0f); // 60 C seems like a good target to tune on
         pidtuner.setLoopInterval(pid_loop_interval * 1000); // same as AutoPID timestep
         pidtuner.setOutputRange(0.0f, 1.0f); // same as AutoPIDrelay
         pidtuner.setZNMode(PIDAutotuner::ZNModeNoOvershoot);
-        pidtuner.setTuningCycles(10);
+        pidtuner.setTuningCycles(5);
     }
 
     void start() {
         if (enabled) return;
-
         enabled = true;
         pidtuner.startTuningLoop(micros());
     }
@@ -689,7 +706,9 @@ public:
                 return;
             }
 
-            control_value = pidtuner.tune(temp_sensor.get(), ms);
+            float temp = temp_sensor.get();
+
+            control_value = pidtuner.tune(temp, ms);
         }
 
         // handle the heating element
@@ -723,11 +742,19 @@ protected:
 /// Handles status update messages to mqtt, and listens to mqtt commands back
 class MQTTHandler {
 public:
-    MQTTHandler(Config &conf, Controller &ctl)
-            : conf(conf), enabled(false), wifiClient(), client(wifiClient), ctl(ctl)
+    MQTTHandler(Config &conf, Controller &ctl, Timer &t)
+            : conf(conf)
+            , enabled(false)
+            , wifiClient()
+            , client(wifiClient)
+            , ctl(ctl)
+            , timer(t)
     {
-        set_temp_topic[0] = 0;
+        set_temp_topic[0]   = 0;
         set_status_topic[0] = 0;
+        set_kp_topic[0]     = 0;
+        set_ki_topic[0]     = 0;
+        set_kd_topic[0]     = 0;
     }
 
     bool is_enabled() const { return enabled; }
@@ -742,6 +769,9 @@ public:
             client.setCallback([&](char *topic, byte *payload, unsigned int length){ callback(topic, payload, length); });
             snprintf(set_temp_topic, 128, "%s/temp/set", conf.mqtt_topic_prefix);
             snprintf(set_status_topic, 128, "%s/status/set", conf.mqtt_topic_prefix);
+            snprintf(set_kp_topic, 128, "%s/kp/set", conf.mqtt_topic_prefix);
+            snprintf(set_ki_topic, 128, "%s/ki/set", conf.mqtt_topic_prefix);
+            snprintf(set_kd_topic, 128, "%s/kd/set", conf.mqtt_topic_prefix);
         }
     }
 
@@ -756,10 +786,14 @@ public:
             Serial.println("MQTT Publish");
             // report back
             char topic[128];
-            snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
-            client.publish(topic, String(temp).c_str());
+            if (ctl.is_pid_enabled()) {
+                snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
+                client.publish(topic, String(temp).c_str());
+            }
             snprintf(topic, 128, "%s/status", conf.mqtt_topic_prefix);
             client.publish(topic, status);
+            snprintf(topic, 128, "%s/timer", conf.mqtt_topic_prefix);
+            client.publish(topic, String(timer.get_remaining() / 1000).c_str()); // time remaining, in seconds
         }
     }
 
@@ -781,6 +815,18 @@ private:
             case STAT_START: ctl.set_enabled(true); break;
             default: ;// ---- ignore
             }
+        } else if (strcmp(topic, set_kp_topic) == 0) {
+            strncpy(conf.kp, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            conf.kp[NUM_LEN - 1] = 0; // just to be sure...
+            ctl.set_gains();
+        } else if (strcmp(topic, set_ki_topic) == 0) {
+            strncpy(conf.ki, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            conf.kp[NUM_LEN - 1] = 0; // just to be sure...
+            ctl.set_gains();
+        } else if (strcmp(topic, set_kd_topic) == 0) {
+            strncpy(conf.kd, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            conf.kp[NUM_LEN - 1] = 0; // just to be sure...
+            ctl.set_gains();
         }
     }
 
@@ -830,8 +876,12 @@ private:
     WiFiClient wifiClient;
     PubSubClient client;
     Controller &ctl;
+    Timer &timer;
     char set_temp_topic[128]; // built in setup to avouid doing this repetedly
-    char set_status_topic[128]; // built in setup to avouid doing this repetedly
+    char set_status_topic[128];
+    char set_kp_topic[128];
+    char set_ki_topic[128];
+    char set_kd_topic[128];
 };
 
 
@@ -848,6 +898,8 @@ public:
 
     virtual void on_rotate(int revs) { rot = revs; };
     virtual void on_button(ClickEncoder::Button b) { button = b; };
+
+    virtual void format_status(char *ptr, unsigned len) { ptr[0] = 0; }
 
 protected:
     ClickEncoder::Button get_button() {
@@ -875,6 +927,7 @@ public:
 
     void draw() override;
     void enter() override { index = 0; selected = false; held = false; }
+    void format_status(char *ptr, unsigned len) override;
 
 protected:
     bool selected = false; // true if item is selected
@@ -886,8 +939,8 @@ class SetupScreen : public UIScreen {
 public:
     SetupScreen(UI &ui) : UIScreen(ui) {}
     void draw() override;
-
     void enter() override { index = 0; selected = false; held = false; }
+    void format_status(char *ptr, unsigned len) override;
 
 protected:
     bool selected = false; // true if item is selected
@@ -902,6 +955,7 @@ public:
     void draw() override;
 
     void enter() override { held = false; };
+    void format_status(char *ptr, unsigned len) override;
 
 protected:
     // pressed button, as last remembered from the draw call
@@ -1020,9 +1074,9 @@ public:
 
             // this will handle disabling the autotuner as well...
             if (pidtuner.is_finished()) {
-                snprintf(conf.kp, NUM_LEN, "%f", pidtuner.getKp());
-                snprintf(conf.ki, NUM_LEN, "%f", pidtuner.getKi());
-                snprintf(conf.kd, NUM_LEN, "%f", pidtuner.getKd());
+                snprintf(conf.kp, NUM_LEN, "%f", pidtuner.get_kp());
+                snprintf(conf.ki, NUM_LEN, "%f", pidtuner.get_ki());
+                snprintf(conf.kd, NUM_LEN, "%f", pidtuner.get_kd());
             }
         } else {
             // will handle timer and temp_sensor update for us...
@@ -1058,7 +1112,7 @@ public:
 
             lastDraw = ms;
             // draw the status bar
-            draw_status_bar();
+            draw_status_bar(scr);
             // draw the screen
             scr.draw();
             // screen done it's job, flip
@@ -1085,7 +1139,7 @@ public:
     }
 
 protected:
-    void draw_status_bar() {
+    void draw_status_bar(UIScreen &scr) {
         static int counter = 0;
         counter++;
 
@@ -1097,8 +1151,6 @@ protected:
 
         if (counter > 10 * 50) return;
 
-        char stmp[10];
-
         // separating line
         disp.drawLine(0, 11, width, 11);
 
@@ -1106,29 +1158,9 @@ protected:
             disp.fillCircle(5,5,3);
         }
 
-        // since the controls are lagging when temp measurement is done,
-        // do this only if we don't need controls
-        if (ctl.is_pid_enabled() && ctl.is_enabled()) {
-            float ftmp = temp.get();
-            snprintf(stmp, 10, "%3.1f C", ftmp);
-            disp.drawString(10, 0, stmp);
-            ftmp = ctl.get_target_temp();
-            snprintf(stmp, 10, "^%3.1f C", ftmp);
-            disp.drawString(45, 0, stmp);
-        } else {
-            // NOT NEEDED           disp.drawString(0, 0, "---");
-        }
-
-        // and also display timer if enabled
-        unsigned long remaining = timer.get_remaining();
-        unsigned long secs = (remaining % 60000) / 1000;
-        remaining = remaining / 60000; // to minutes
-
-        // a dot means a stopped timer
-        char ts = timer.is_enabled() ? ' ' : '.';
-
-        snprintf(stmp, 10, "%c%02ld:%02ld:%02ld", ts, remaining / 60, remaining % 60, secs);
-        disp.drawString(83, 0, stmp);
+        char stmp[32];
+        scr.format_status(stmp, 32);
+        disp.drawString(11, 0, stmp);
     }
 
     UIScreen &get_screen(State st) {
@@ -1256,6 +1288,12 @@ void ConfigScreen::draw() {
     draw_cursor_horizonal(disp, 3 + (selected ? voff : 0), 4 + 15 * (index + 1), held);
 }
 
+void ConfigScreen::format_status(char *ptr, unsigned int len) {
+    const auto &ip = WiFi.localIP();
+    float ftmp = ui.get_tempsensor().get();
+    snprintf(ptr, len, "%d.%d.%d.%d | %3.2f C", ip[0], ip[1], ip[2], ip[3], ftmp);
+}
+
 void SetupScreen::draw() {
     // inactivity counter
     static int counter = 0;
@@ -1346,6 +1384,11 @@ void SetupScreen::draw() {
     draw_cursor_horizonal(disp, 3 + (selected ? voff : 0), 4 + 15 * (index + 1), held);
 }
 
+void SetupScreen::format_status(char *ptr, unsigned int len) {
+    auto &temp = ui.get_tempsensor();
+    float ftmp = temp.get();
+    snprintf(ptr, 10, "%3.2f C", ftmp);
+}
 
 void InfoScreen::draw() {
     auto &disp = ui.get_display();
@@ -1362,6 +1405,28 @@ void InfoScreen::draw() {
     if (held) disp.fillCircle(5, 16, 3);
 
     counter++;
+}
+
+void InfoScreen::format_status(char *ptr, unsigned int len) {
+    auto &temp = ui.get_tempsensor();
+    auto &ctl = ui.get_controller();
+    auto &timer = ui.get_timer();
+    float ftmp = temp.get();
+
+    // and also display timer if enabled
+    unsigned long remaining = timer.get_remaining();
+    remaining = remaining / 60000; // to minutes
+
+    // a dot means a stopped timer
+    char ts = timer.is_enabled() ? ' ' : '.';
+
+    char ctl_tmp[7];
+
+    if (ctl.is_pid_enabled()) {
+        snprintf(ctl_tmp, 7, "%3.1f C", ctl.get_target_temp());
+    }
+
+    snprintf(ptr, len, "%3.2f C%s %c%02ld:%02ld", ftmp, ctl_tmp, ts, remaining / 60, remaining % 60);
 }
 
 void AutotuneScreen::draw() {
@@ -1455,7 +1520,7 @@ Timer timer;
 Controller controller(conf, RELAY_PIN, temp, timer);
 PIDTuner pidtuner(conf, temp, controller);
 UI ui(conf, display, encoder, controller, pidtuner, temp, timer, network);
-MQTTHandler mqtt(conf, controller);
+MQTTHandler mqtt(conf, controller, timer);
 
 void check_temp_sensor()
 {
@@ -1481,6 +1546,8 @@ void setup()
     // we enable programming over WiFi in setup mode
     if (config_mode) ArduinoOTA.begin();
 
+    // TODO: Display Programming screen while programming over OTA
+
     // encoder button is digital, we do this by hand instead
     network.setup();
 
@@ -1492,6 +1559,9 @@ void setup()
 
     temp.begin(conf.get_temp_offset());
     controller.begin();
+
+    pidtuner.setup();
+
     ui.begin();
 
     mqtt.setup();
