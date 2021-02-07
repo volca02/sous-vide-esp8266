@@ -458,7 +458,7 @@ public:
 
     int resolution = 10;
     DeviceAddress tempDeviceAddress;
-    int  delayInMillis = 0; //
+    unsigned long delayInMillis = 0; //
 };
 
 /*
