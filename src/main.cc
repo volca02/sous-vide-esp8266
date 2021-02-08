@@ -786,10 +786,8 @@ public:
             Serial.println("MQTT Publish");
             // report back
             char topic[128];
-            if (ctl.is_pid_enabled()) {
-                snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
-                client.publish(topic, String(temp).c_str());
-            }
+            snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
+            client.publish(topic, String(temp).c_str());
             snprintf(topic, 128, "%s/status", conf.mqtt_topic_prefix);
             client.publish(topic, status);
             snprintf(topic, 128, "%s/timer", conf.mqtt_topic_prefix);
