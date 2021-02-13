@@ -241,7 +241,7 @@ using Display = SH1106Spi;
 
 #define RELAY_PIN   D8
 
-const char *version_str = "0.0.1";
+const char *version_str = "0.0.2";
 
 constexpr byte CURSOR_SIZE = 5;
 
@@ -272,6 +272,7 @@ Solid state relay:
 TODO:
  * NTP support, display current time in corner
  * fahrenheit as a second value when setting temp (no conversion needed when cooking by the book)
+ * Controller constants can't be set over MQTT. Diagnose that
 
 DONE:
  X SousVide mode does NOT end after timer ends
@@ -443,7 +444,7 @@ public:
             temp = dallas.getTempCByIndex(0);
             last_update = time;
             dallas.requestTemperatures();
-            // TODO: Could record temp history here...
+            // TOO: Could record temp history here...
         }
 
         // in case someone measured and set this, we add offset here
@@ -459,6 +460,82 @@ public:
     int resolution = 10;
     DeviceAddress tempDeviceAddress;
     unsigned long delayInMillis = 0; //
+};
+
+/** PID seems not like a good fit for us (oveshoot, nonlinear)
+ * this implements a bang-bang controller with a nonsymmetrical hysteresis
+ * instead.
+ * What it does is try to oscillate betwen setpoint - undershoot and setpoint
+ * but it also checks for overshoot by not stepping over the setpoint - overshoot threshold
+ * while heating up without "PWM"
+ */
+class BangController {
+public:
+    BangController(double *input,
+                   double *setpoint,
+                   double *output,
+                   double overshoot = 1.5,
+                   double undershoot = 0.5)
+        : _input(input)
+        , _setpoint(setpoint)
+        , _output(output)
+        , _overshoot(overshoot)
+        , _undershoot(undershoot)
+        , _last_switch(0)
+    {}
+
+    void run() {
+        auto min = get_falling_min();
+        auto max = get_growing_max();
+        auto now = millis();
+
+        if (_heating && (*_input > max) && ((now - _last_switch) > _period)) {
+            set_heating(false);
+            _last_switch = now;
+        } else if (!_heating && (*_input < min)
+                   && ((now - _last_switch) > _period))
+        {
+            set_heating(true);
+            _last_switch = now;
+        }
+    }
+
+    void reset() {
+        set_heating(false);
+    }
+
+    void set_overshoot(float over)    { _overshoot  = over; }
+    void set_undershoot(float under)  { _undershoot = under; }
+    void set_period(unsigned long p)  { _period     = p; }
+
+private:
+    void heating_on() {
+        set_heating(true);
+    };
+
+    void heating_off() {
+        set_heating(false);
+    };
+
+    void set_heating(bool ena) {
+        if (_heating == ena) return;
+
+        _heating = ena;
+        *_output = _heating ? 1.0f : 0.0f;
+    }
+
+    double get_growing_max() { return *_setpoint - _overshoot; }
+    double get_falling_min() { return *_setpoint - _undershoot; }
+
+    double *_input, *_setpoint, *_output;
+
+    bool _heating = true;
+
+    float _overshoot = 1.5;
+    float _undershoot = 0.5;
+
+    unsigned long _last_switch = 0;
+    unsigned long _period = 5000; // 5s default period
 };
 
 /*
@@ -505,6 +582,8 @@ public:
         pid.setGains(conf.get_kp(), conf.get_ki(), conf.get_kd());
     }
 
+    double get_control_value() { return pid.getPulseValue(); }
+
     // **** this section enables/disables the controller ****
     void set_enabled(bool ena) {
         if (ena == enabled) return;
@@ -520,6 +599,7 @@ public:
             heating_off();
             started = false;
             preheating = true;
+            did_reset = false;
         }
     }
 
@@ -600,6 +680,14 @@ public:
 
         bool atPoint = pid.atSetPoint(preheat_threshold);
 
+        // first time we get close to the set point, we reset the pid control values)
+        // this stops some of the overshoot due to the integral growing out of range
+        if (atPoint && !did_reset) {
+            // this is a naiive implementation of Anti-Integral Windup
+            did_reset = true;
+            pid.reset();
+        }
+
         // are we preheating or are we set around the target range?
         // once we get in the temp range, we dont't ever get out
         // unless we reset the whole process.
@@ -637,6 +725,7 @@ protected:
     bool pid_mode      = false; // when disabled, simple heating is used
     bool enabled       = false; // after settings get put in, setting this to true will enable the controller
     bool preheating    = true;  // initial phase after controller gets started
+    bool did_reset     = false; // did we reset the pid ctl yet?
     bool heating       = false; // true if the heater is on
     bool started       = false; // after initial pre-heat, we wait for user input once
 
@@ -675,7 +764,7 @@ public:
     void setup() {
         // only call update if the loop interval reached the pid loop interval
         pidtuner.setTargetValue(60.0f); // 60 C seems like a good target to tune on
-        pidtuner.setLoopInterval(pid_loop_interval * 1000); // same as AutoPID timestep
+        pidtuner.setLoopInterval(pid_loop_interval * 1000); // same as AutoPID timestep. pidtuner works in microseconds...
         pidtuner.setOutputRange(0.0f, 1.0f); // same as AutoPIDrelay
         pidtuner.setZNMode(PIDAutotuner::ZNModeNoOvershoot);
         pidtuner.setTuningCycles(5);
@@ -767,11 +856,12 @@ public:
             int port = atoi(conf.mqtt_port);
             client.setServer(conf.mqtt_server, port);
             client.setCallback([&](char *topic, byte *payload, unsigned int length){ callback(topic, payload, length); });
-            snprintf(set_temp_topic, 128, "%s/temp/set", conf.mqtt_topic_prefix);
+
+            snprintf(set_temp_topic,   128, "%s/temp/set",   conf.mqtt_topic_prefix);
             snprintf(set_status_topic, 128, "%s/status/set", conf.mqtt_topic_prefix);
-            snprintf(set_kp_topic, 128, "%s/kp/set", conf.mqtt_topic_prefix);
-            snprintf(set_ki_topic, 128, "%s/ki/set", conf.mqtt_topic_prefix);
-            snprintf(set_kd_topic, 128, "%s/kd/set", conf.mqtt_topic_prefix);
+            snprintf(set_kp_topic,     128, "%s/kp/set",     conf.mqtt_topic_prefix);
+            snprintf(set_ki_topic,     128, "%s/ki/set",     conf.mqtt_topic_prefix);
+            snprintf(set_kd_topic,     128, "%s/kd/set",     conf.mqtt_topic_prefix);
         }
     }
 
@@ -786,12 +876,41 @@ public:
             Serial.println("MQTT Publish");
             // report back
             char topic[128];
+
             snprintf(topic, 128, "%s/temp", conf.mqtt_topic_prefix);
             client.publish(topic, String(temp).c_str());
+
             snprintf(topic, 128, "%s/status", conf.mqtt_topic_prefix);
             client.publish(topic, status);
+
+            // format the time...
             snprintf(topic, 128, "%s/timer", conf.mqtt_topic_prefix);
-            client.publish(topic, String(timer.get_remaining() / 1000).c_str()); // time remaining, in seconds
+
+            auto rem_seconds = timer.get_remaining() / 1000;
+            auto hours   = rem_seconds / 3600;
+            rem_seconds  = rem_seconds % 3600;
+            auto minutes = rem_seconds / 60;
+            auto seconds = rem_seconds % 60;
+
+            char value[32];
+            snprintf(value, 16, "%02ld:%02ld:%02ld", hours, minutes, seconds);
+            client.publish(topic, value);
+
+            snprintf(topic, 128, "%s/heating", conf.mqtt_topic_prefix);
+            client.publish(topic, ctl.is_heating() ? "1" : "0");
+
+            snprintf(topic, 128, "%s/control_value", conf.mqtt_topic_prefix);
+            client.publish(topic, String(ctl.get_control_value()).c_str());
+
+            // we also publish the controller constants
+            snprintf(topic, 128, "%s/kp", conf.mqtt_topic_prefix);
+            client.publish(topic, conf.kp);
+
+            snprintf(topic, 128, "%s/ki", conf.mqtt_topic_prefix);
+            client.publish(topic, conf.ki);
+
+            snprintf(topic, 128, "%s/kd", conf.mqtt_topic_prefix);
+            client.publish(topic, conf.kd);
         }
     }
 
@@ -803,6 +922,13 @@ private:
     };
 
     void callback(char* topic, byte* payload, unsigned int length) {
+        if (length >= 128) return;
+
+        // this makes work with the value a lot easier
+        char value[128];
+        strncpy(value, (char*)payload, 128);
+        value[length] = 0;
+
         if (strcmp(topic, set_temp_topic) == 0) {
             float temp = atof((char*)payload);
             ctl.set_target_temp(temp);
@@ -814,15 +940,15 @@ private:
             default: ;// ---- ignore
             }
         } else if (strcmp(topic, set_kp_topic) == 0) {
-            strncpy(conf.kp, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            strncpy(conf.kp, value, NUM_LEN);
             conf.kp[NUM_LEN - 1] = 0; // just to be sure...
             ctl.set_gains();
         } else if (strcmp(topic, set_ki_topic) == 0) {
-            strncpy(conf.ki, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            strncpy(conf.ki, value, NUM_LEN);
             conf.kp[NUM_LEN - 1] = 0; // just to be sure...
             ctl.set_gains();
         } else if (strcmp(topic, set_kd_topic) == 0) {
-            strncpy(conf.kd, (char *)payload, length < NUM_LEN ? length : NUM_LEN);
+            strncpy(conf.kd, value, NUM_LEN);
             conf.kp[NUM_LEN - 1] = 0; // just to be sure...
             ctl.set_gains();
         }
@@ -875,7 +1001,8 @@ private:
     PubSubClient client;
     Controller &ctl;
     Timer &timer;
-    char set_temp_topic[128]; // built in setup to avouid doing this repetedly
+
+    char set_temp_topic[128]; // built in setup to avoid doing this repetedly
     char set_status_topic[128];
     char set_kp_topic[128];
     char set_ki_topic[128];
@@ -1542,7 +1669,22 @@ void setup()
     config_mode = analogRead(ROT_KEY_PIN) < 128; // hardcoded, should do
 
     // we enable programming over WiFi in setup mode
-    if (config_mode) ArduinoOTA.begin();
+    if (config_mode) {
+        ArduinoOTA.onStart([]() {
+            const char *msg = (ArduinoOTA.getCommand() == U_FLASH)
+                                      ? "updating sketch"
+                                      : "updating filesystem";
+
+            Serial.println(msg);
+            ui.error_screen(msg);
+        });
+        ArduinoOTA.onEnd([]() {
+            Serial.println("Updated...");
+            ui.error_screen("Update complete");
+        });
+
+        ArduinoOTA.begin();
+    }
 
     // TODO: Display Programming screen while programming over OTA
 
