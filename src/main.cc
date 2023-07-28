@@ -15,7 +15,9 @@
 #include <IotWebConfUsing.h>
 #include <PubSubClient.h>
 
+#ifdef AUTOTUNER
 #include <pidautotuner.h>
+#endif
 
 static int8_t ICACHE_FLASH_ATTR todigit(char ch) {
     if (ch >= '0' && ch <= '9')
@@ -165,8 +167,8 @@ public:
 
         // AP mode config portal
         auto state = iotWebConf.getState();
-        if (state == IOTWEBCONF_STATE_AP_MODE
-            || state == IOTWEBCONF_STATE_NOT_CONFIGURED)
+        if (state == iotwebconf::ApMode
+            || state == iotwebconf::NotConfigured)
         {
             iotWebConf.handleConfig();
             return;
@@ -699,7 +701,9 @@ public:
     }
 
 protected:
+#ifdef AUTOTUNER
     friend class PIDTuner;
+#endif
 
     void heating_on() {
         set_heating(true);
@@ -737,6 +741,7 @@ protected:
     AutoPIDRelay pid;
 };
 
+#ifdef AUTOTUNER
 class PIDTuner {
 public:
     PIDTuner(Config &config, TempSensor &temp, Controller &ctl)
@@ -827,6 +832,7 @@ protected:
     double control_value = 0;
     unsigned long last_pulse_time = 0;
 };
+#endif
 
 /// Handles status update messages to mqtt, and listens to mqtt commands back
 class MQTTHandler {
@@ -1121,13 +1127,17 @@ public:
        Display &display,
        ClickEncoder &encoder,
        Controller &controller,
+#ifdef AUTOTUNER
        PIDTuner &pidtuner,
+#endif
        TempSensor &temp_sensor,
        Timer &timer,
        NetworkHandler &network)
             : conf(conf)
             , ctl(controller)
+#ifdef AUTOTUNER
             , pidtuner(pidtuner)
+#endif
             , temp(temp_sensor)
             , timer(timer)
             , network(network)
@@ -1194,6 +1204,7 @@ public:
     };
 
     void update() {
+#ifdef AUTOTUNER
         if (pidtuner.is_enabled()) {
             pidtuner.update();
 
@@ -1204,9 +1215,12 @@ public:
                 snprintf(conf.kd, NUM_LEN, "%f", pidtuner.get_kd());
             }
         } else {
+#endif
             // will handle timer and temp_sensor update for us...
             ctl.update();
+#ifdef AUTOTUNER
         }
+#endif
 
         // analyze the controller state and change ui accordingly
         State new_state = infer_state();
@@ -1249,13 +1263,17 @@ public:
     Display    &get_display()    { return disp; }
 
     Controller &get_controller() { return ctl; }
+#ifdef AUTOTUNER
     PIDTuner   &get_pidtuner() { return pidtuner; }
-    TempSensor &get_tempsensor() { return temp; }
+#endif 
+   TempSensor &get_tempsensor() { return temp; }
     Timer      &get_timer()      { return timer; }
     NetworkHandler &get_network()    { return network; }
 
     State infer_state() {
+#ifdef AUTOTUNER
         if (pidtuner.is_enabled()) return ST_AUTOTUNE;
+#endif
         if (config_mode) return ST_CONFIG;
         if (timer.done()) return ST_DONE;
         if (!ctl.is_enabled()) return ST_SETUP;
@@ -1303,7 +1321,9 @@ protected:
     Config &conf;
 
     Controller &ctl;
+#ifdef AUTOTUNER
     PIDTuner   &pidtuner;
+#endif
     TempSensor &temp;
     Timer &timer;
     NetworkHandler &network;
@@ -1336,7 +1356,9 @@ void ConfigScreen::draw() {
     auto &disp = ui.get_display();
 
     auto &conf = ui.get_config();
+#ifdef AUTOTUNER
     auto &pidtuner = ui.get_pidtuner();
+#endif
     auto &network = ui.get_network();
 
     // handle input....
@@ -1361,9 +1383,11 @@ void ConfigScreen::draw() {
     // no select for first item...
     if (selected && index == 0) selected = false;
 
+#ifdef AUTOTUNER
     if (released && held && index == 0) {
         pidtuner.start();
     }
+#endif
 
     if (rot != 0) {
         if (selected) {
@@ -1518,13 +1542,17 @@ void SetupScreen::format_status(char *ptr, unsigned int len) {
 void InfoScreen::draw() {
     auto &disp = ui.get_display();
     auto &ctl = ui.get_controller();
+#ifdef AUTOTUNER
     auto &pidtuner = ui.get_pidtuner();
+#endif
 
     last_button = get_button();
     if (last_button == ClickEncoder::Held) held = true;
     if (last_button == ClickEncoder::Released && held) {
         ctl.disable();
+#ifdef AUTOTUNER
         pidtuner.stop();
+#endif
     }
 
     if (held) disp.fillCircle(5, 16, 3);
@@ -1643,8 +1671,16 @@ NetworkHandler network(conf); // loads the config for us
 TempSensor temp(TEMP_SENSOR_PIN);
 Timer timer;
 Controller controller(conf, RELAY_PIN, temp, timer);
+#ifdef AUTOTUNER
 PIDTuner pidtuner(conf, temp, controller);
-UI ui(conf, display, encoder, controller, pidtuner, temp, timer, network);
+#endif
+
+UI ui(conf, display, encoder, controller, 
+#ifdef AUTOTUNER
+      pidtuner, 
+#endif
+      temp, timer, network);
+
 MQTTHandler mqtt(conf, controller, timer);
 
 void check_temp_sensor()
@@ -1700,7 +1736,9 @@ void setup()
     temp.begin(conf.get_temp_offset());
     controller.begin();
 
+#ifdef AUTOTUNER
     pidtuner.setup();
+#endif
 
     ui.begin();
 
